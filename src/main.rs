@@ -5,6 +5,12 @@ mod file_type;
 mod encryption_extractor;
 use std::io::{self, Write};
 
+/*
+test 
+/home/ali/Downloads/libere.xlsx
+/home/ali/Downloads/office2013.xlsx
+ */
+
 fn main() {
      banner::print_banner();
 
