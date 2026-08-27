@@ -7,8 +7,8 @@ use std::io::{self, Write};
 
 /*
 test 
-/home/ali/Downloads/libere.xlsx
-/home/ali/Downloads/office2013.xlsx
+-f /home/ali/Downloads/libere.xlsx
+-f /home/ali/Downloads/office2013.xlsx
  */
 
 fn main() {
@@ -29,6 +29,9 @@ fn main() {
         let mut input = String::new();
         if io::stdin().read_line(&mut input).is_err() {
             continue;
+        }
+        if input.is_empty() {
+            break; // EOF
         }
 
         let trimmed = input.trim();
@@ -60,7 +63,12 @@ fn main() {
                                 // parse_excel(args[1]);
                                 if ft == "Excel 2007 to 2016+" {
                                     // call the function to extract encryption information for Excel 2007 to 2016+ files
-                                    encryption_extractor::excel_2007_to_2016(args[1]);
+                                    // it returns the hashcat hash and its mode, then start the attack
+                                    if let Some((hash, hashcat_mode)) =
+                                        encryption_extractor::excel_2007_to_2016(args[1])
+                                    {
+                                        hashcat::run_attack(&hash, &hashcat_mode);
+                                    }
                                 }
                             },
                             None => println!("Error: Could not determine the file type."),

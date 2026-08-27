@@ -1,13 +1,14 @@
 use std::path::Path;
 use std::io::Read;
 
-pub fn excel_2007_to_2016(file_path: &str) {
+/// Returns the hashcat hash and its hashcat mode, or None on failure.
+pub fn excel_2007_to_2016(file_path: &str) -> Option<(String, String)> {
     println!("File Type: Excel 2007 to 2016+ (Encrypted OLE Container)");
 
     let path = Path::new(file_path);
     if !path.exists() {
         println!("Error: File does not exist: {}", file_path);
-        return;
+        return None;
     }
 
     match cfb::open(path) {
@@ -22,19 +23,27 @@ pub fn excel_2007_to_2016(file_path: &str) {
                                     "Success: Found 'EncryptionInfo' stream! Read {} bytes.",
                                     size
                                 );
-                                parse_encryption_info(&encryption_info_data);
+                                parse_encryption_info(&encryption_info_data)
                             }
-                            Err(e) => println!("Error reading EncryptionInfo stream: {}", e),
+                            Err(e) => {
+                                println!("Error reading EncryptionInfo stream: {}", e);
+                                None
+                            }
                         }
                     }
-                    Err(e) => println!("Error opening EncryptionInfo stream: {}", e),
+                    Err(e) => {
+                        println!("Error opening EncryptionInfo stream: {}", e);
+                        None
+                    }
                 }
             } else {
                 println!("Status: The OLE container does not contain an 'EncryptionInfo' stream.");
+                None
             }
         }
         Err(e) => {
             println!("Error: Failed to open file as an OLE/CFB container: {}", e);
+            None
         }
     }
 }
@@ -43,10 +52,10 @@ pub fn excel_2007_to_2016(file_path: &str) {
 //  Top-level dispatcher
 // ──────────────────────────────────────────────────────────────
 
-fn parse_encryption_info(data: &[u8]) {
+fn parse_encryption_info(data: &[u8]) -> Option<(String, String)> {
     if data.len() < 4 {
         eprintln!("Error: EncryptionInfo stream too short ({} bytes).", data.len());
-        return;
+        return None;
     }
 
     // Version header: [vMajor (u16 LE), vMinor (u16 LE)]
@@ -55,9 +64,12 @@ fn parse_encryption_info(data: &[u8]) {
     println!("Encryption Version: vMajor={}, vMinor={}", v_major, v_minor);
 
     match v_major {
-        4 => parse_agile_encryption(&data[4..]),
-        2 | 3 => parse_standard_encryption(&data[4..], v_major),
-        _ => println!("Unsupported encryption version: vMajor={}", v_major),
+        4 => Some(parse_agile_encryption(&data[4..])),
+        2 | 3 => Some(parse_standard_encryption(&data[4..], v_major)),
+        _ => {
+            println!("Unsupported encryption version: vMajor={}", v_major);
+            None
+        }
     }
 }
 
@@ -66,7 +78,7 @@ fn parse_encryption_info(data: &[u8]) {
 //  After the 4-byte version, the rest is XML.
 // ──────────────────────────────────────────────────────────────
 
-fn parse_agile_encryption(data: &[u8]) {
+fn parse_agile_encryption(data: &[u8]) -> (String, String) {
     // Auto-detect XML start (some files have 4 reserved bytes before XML)
     let xml_start = if data.starts_with(b"<?xml") || data.starts_with(b"<encryption") {
         0
@@ -89,25 +101,38 @@ fn parse_agile_encryption(data: &[u8]) {
         Ok(s) => s,
         Err(e) => {
             println!("Error: Failed to parse XML from EncryptionInfo stream: {}", e);
-            return;
+            return (String::new(), String::new());
         }
     };
 
     println!("\n=== Agile Encryption (Office 2010+) ===");
 
+    // The password-specific parameters all live on the <p:encryptedKey>
+    // element. saltValue also appears on <keyData>, so restrict the search
+    // to the <p:encryptedKey> opening tag (self-closing in practice).
+    let enc_key = match xml_str.find("<p:encryptedKey") {
+        Some(start) => {
+            match xml_str[start..].find('>') {
+                Some(end) => &xml_str[start..start + end + 1],
+                None => xml_str,
+            }
+        }
+        None => xml_str,
+    };
+
     // Extract attributes from <p:encryptedKey> element
-    let spin_count = xml_attr(xml_str, "spinCount");
-    let key_bits = xml_attr(xml_str, "keyBits");
-    let salt_size = xml_attr(xml_str, "saltSize");
-    let block_size = xml_attr(xml_str, "blockSize");
-    let hash_size = xml_attr(xml_str, "hashSize");
-    let cipher_algorithm = xml_attr(xml_str, "cipherAlgorithm");
-    let cipher_chaining = xml_attr(xml_str, "cipherChaining");
-    let hash_algorithm = xml_attr(xml_str, "hashAlgorithm");
-    let salt_value_b64 = xml_attr(xml_str, "saltValue");
-    let evhi_b64 = xml_attr(xml_str, "encryptedVerifierHashInput");
-    let evhv_b64 = xml_attr(xml_str, "encryptedVerifierHashValue");
-    let ekv_b64 = xml_attr(xml_str, "encryptedKeyValue");
+    let spin_count = xml_attr(enc_key, "spinCount");
+    let key_bits = xml_attr(enc_key, "keyBits");
+    let salt_size = xml_attr(enc_key, "saltSize");
+    let block_size = xml_attr(enc_key, "blockSize");
+    let hash_size = xml_attr(enc_key, "hashSize");
+    let cipher_algorithm = xml_attr(enc_key, "cipherAlgorithm");
+    let cipher_chaining = xml_attr(enc_key, "cipherChaining");
+    let hash_algorithm = xml_attr(enc_key, "hashAlgorithm");
+    let salt_value_b64 = xml_attr(enc_key, "saltValue");
+    let evhi_b64 = xml_attr(enc_key, "encryptedVerifierHashInput");
+    let evhv_b64 = xml_attr(enc_key, "encryptedVerifierHashValue");
+    let ekv_b64 = xml_attr(enc_key, "encryptedKeyValue");
 
     println!("  spinCount:                   {}", spin_count.as_deref().unwrap_or("N/A"));
     println!("  keyBits:                     {}", key_bits.as_deref().unwrap_or("N/A"));
@@ -145,9 +170,14 @@ fn parse_agile_encryption(data: &[u8]) {
     let kb = key_bits.as_deref().unwrap_or("256");
     let ss = salt_size.as_deref().unwrap_or("16");
 
+    // hashcat modes 9500/9600 expect the encrypted verifier hash to be
+    // exactly 32 bytes (64 hex chars). For Office 2013 the value is a 64-byte
+    // SHA-512 hash; only the first 32 bytes are compared, so truncate.
+    let evhv_hex_trimmed = &evhv_hex[..evhv_hex.len().min(64)];
+
     let hash = format!(
         "$office$*{}*{}*{}*{}*{}*{}*{}",
-        office_version, spin, kb, ss, salt_hex, evhi_hex, evhv_hex
+        office_version, spin, kb, ss, salt_hex, evhi_hex, evhv_hex_trimmed
     );
 
     let hashcat_mode = match office_version {
@@ -159,51 +189,58 @@ fn parse_agile_encryption(data: &[u8]) {
     println!("\n  office2john / hashcat hash:");
     println!("  {}", hash);
     println!("  hashcat mode: {}", hashcat_mode);
+
+    (hash, hashcat_mode.to_string())
 }
 
 // ──────────────────────────────────────────────────────────────
-//  Standard / Extensible Encryption (Office 2007)
-//  After the 4-byte version, binary header + verifier follow.
+//  Standard / Extensible Encryption (Office 2007 / 2010 compat)
+//  After the 4-byte version, two 4-byte fields (header flags +
+//  encryption header size) precede the binary header + verifier.
 // ──────────────────────────────────────────────────────────────
 
-fn parse_standard_encryption(data: &[u8], version: u16) {
-    // EncryptionHeader layout (all u32 LE):
-    //   [ 0.. 4] Flags
-    //   [ 4.. 8] SizeExtra
-    //   [ 8..12] AlgID
-    //   [12..16] AlgIDHash
-    //   [16..20] KeySize       (in bits)
-    //   [20..24] ProviderType
-    //   [24..28] Reserved1
-    //   [28..32] Reserved2
-    //   [32..  ] CSPName  (null-terminated UTF-16LE)
+fn parse_standard_encryption(data: &[u8], version: u16) -> (String, String) {
+    // EncryptionInfo layout (all u32 LE):
+    //   [ 0.. 4] HeaderFlags  (reserved)
+    //   [ 4.. 8] EncryptionHeaderSize  (size of EncryptionHeader in bytes)
+    //   [ 8..12] Header.Flags
+    //   [12..16] Header.SizeExtra
+    //   [16..20] Header.AlgID
+    //   [20..24] Header.AlgIDHash
+    //   [24..28] Header.KeySize       (in bits)
+    //   [28..32] Header.ProviderType
+    //   [32..36] Header.Reserved1
+    //   [36..40] Header.Reserved2
+    //   [40..  ] Header.CSPName  (null-terminated UTF-16LE)
     //
-    // EncryptionVerifier layout (follows CSPName):
+    // EncryptionVerifier layout (follows CSPName null terminator):
     //   [ 0.. 4] SaltSize  (= 0x10)
     //   [ 4..20] Salt  (16 bytes)
     //   [20..36] EncryptedVerifier  (16 bytes)
     //   [36..40] VerifierHashSize  (= 0x14 for SHA1)
     //   [40..72] EncryptedVerifierHash  (32 bytes for AES)
 
-    if data.len() < 36 {
+    if data.len() < 44 {
         println!(
             "Error: Standard encryption data too short ({} bytes).",
             data.len()
         );
-        return;
+        return (String::new(), String::new());
     }
 
-    let flags = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-    let size_extra = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-    let alg_id = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-    let alg_id_hash = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
-    let key_size = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
-    let provider_type = u32::from_le_bytes([data[20], data[21], data[22], data[23]]);
-    let reserved1 = u32::from_le_bytes([data[24], data[25], data[26], data[27]]);
-    let reserved2 = u32::from_le_bytes([data[28], data[29], data[30], data[31]]);
+    let header_flags = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+    let header_size = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+    let flags = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+    let size_extra = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
+    let alg_id = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
+    let alg_id_hash = u32::from_le_bytes([data[20], data[21], data[22], data[23]]);
+    let key_size = u32::from_le_bytes([data[24], data[25], data[26], data[27]]);
+    let provider_type = u32::from_le_bytes([data[28], data[29], data[30], data[31]]);
+    let reserved1 = u32::from_le_bytes([data[32], data[33], data[34], data[35]]);
+    let reserved2 = u32::from_le_bytes([data[36], data[37], data[38], data[39]]);
 
     // Find end of CSPName (search for double-null in UTF-16LE)
-    let mut csp_end = 32;
+    let mut csp_end = 40;
     while csp_end + 1 < data.len() {
         if data[csp_end] == 0 && data[csp_end + 1] == 0 {
             break;
@@ -211,13 +248,15 @@ fn parse_standard_encryption(data: &[u8], version: u16) {
         csp_end += 2;
     }
     let csp_name: String = String::from_utf16_lossy(
-        &data[32..csp_end]
+        &data[40..csp_end]
             .chunks_exact(2)
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect::<Vec<u16>>(),
     );
 
     println!("\n=== Standard Encryption (Office 2007, v{}) ===", version);
+    println!("  HeaderFlags:    0x{:08X}", header_flags);
+    println!("  HeaderSize:     {}", header_size);
     println!("  Flags:         0x{:08X}", flags);
     println!("  SizeExtra:     {}", size_extra);
     println!("  AlgID:         0x{:08X} ({})", alg_id, alg_id_name(alg_id));
@@ -240,7 +279,7 @@ fn parse_standard_encryption(data: &[u8], version: u16) {
             verifier_offset + 72,
             data.len()
         );
-        return;
+        return (String::new(), String::new());
     }
 
     let v = &data[verifier_offset..];
@@ -260,17 +299,24 @@ fn parse_standard_encryption(data: &[u8], version: u16) {
     println!("  VerifierHashSize:      {}", verifier_hash_size);
     println!("  EncryptedVerifierHash:  {}", evh_hex);
 
+    // hashcat mode 9400 expects the encrypted verifier hash to be exactly
+    // 20 bytes (40 hex chars). AES files store 32 bytes where the first
+    // 20 bytes are the SHA1 and the rest is random padding, so truncate.
+    let evh_hex_trimmed = &evh_hex[..evh_hex.len().min(40)];
+
     // Build office2john / hashcat hash
     // $office$*2007*20*<keyBits>*<saltSize>*<salt>*<verifier>*<verifierHash>
     // Note: field 2 = 20 (SHA1 hash size, not spin count — standard enc. has no spin count)
     let hash = format!(
         "$office$*2007*20*{}*{}*{}*{}*{}",
-        key_size, salt_size_val, salt_hex, ev_hex, evh_hex
+        key_size, salt_size_val, salt_hex, ev_hex, evh_hex_trimmed
     );
 
     println!("\n  office2john / hashcat hash:");
     println!("  {}", hash);
     println!("  hashcat mode: 9400");
+
+    (hash, "9400".to_string())
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -316,9 +362,9 @@ fn base64_to_hex(b64: &str) -> String {
 
 fn alg_id_name(alg_id: u32) -> &'static str {
     match alg_id {
-        0x00006601 | 0x00006610 => "AES-128",
-        0x00006602 | 0x00006611 => "AES-192",
-        0x00006603 | 0x00006612 => "AES-256",
+        0x00006601 | 0x0000660E => "AES-128",
+        0x00006602 | 0x0000660F => "AES-192",
+        0x00006603 | 0x00006610 => "AES-256",
         0x00006801 => "RC4",
         _ => "Unknown",
     }

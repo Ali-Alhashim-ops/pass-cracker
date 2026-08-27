@@ -3,3 +3,6 @@
   Password Cracker crack any file protected with password like word excel pdf zip...
 
   1- hashcat is required to be installed 
+
+  test it on xlsx file protected by libera office password         cracked
+  test it on xlsx file protected by Microsoft office 2010 password cracked
