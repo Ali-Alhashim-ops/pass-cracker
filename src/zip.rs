@@ -52,7 +52,7 @@ let (comp_len, uncomp_len, crc32, name_len, extra_len, dos_time, flags, comp_typ
             continue;
         }
 
-        if comp_type != 0 && comp_type != 8 {
+        if comp_type != 0 && comp_type != 8 && comp_type != 99 {
             println!("Error: First encrypted member uses unsupported compression type {}.", comp_type);
             return None;
         }
@@ -115,6 +115,61 @@ let (comp_len, uncomp_len, crc32, name_len, extra_len, dos_time, flags, comp_typ
         println!("    compressed length:        {}", actual_comp_len);
         println!("    uncompressed length:      {}", actual_uncomp_len);
         println!("    crc32:                    0x{:08x}", actual_crc);
+
+        // ── WinZip AES (0x9901 "AE" extra field) → hashcat mode 13600 ──
+        if comp_type == 99 {
+            if let Some((vendor_version, strength, actual_comp)) =
+                find_aes_extra(&data, sig + 30 + name_len, extra_len)
+            {
+                let salt_size = match strength {
+                    1 => 8,   // AES-128
+                    2 => 12,  // AES-192
+                    _ => 16,  // AES-256
+                };
+                let strength_name = match strength {
+                    1 => "AES-128",
+                    2 => "AES-192",
+                    _ => "AES-256",
+                };
+
+                if actual_comp_len < salt_size + 2 + 10 {
+                    println!("Error: AES member too small for salt/verifier/auth ({} bytes).", actual_comp_len);
+                    return None;
+                }
+
+                let salt = &encrypted_data[..salt_size];
+                let verify = &encrypted_data[salt_size..salt_size + 2];
+                let ct = &encrypted_data[salt_size + 2..actual_comp_len - 10]; // encrypted payload
+                let auth = &encrypted_data[actual_comp_len - 10..];
+
+                let aei = if vendor_version == 0x0001 { "AE-1" } else if vendor_version == 0x0002 { "AE-2" } else { "" };
+
+                println!("  Encryption:            WinZip {}", strength_name);
+                println!("  Spec version:          {} (extra vendor version 0x{:04x})", aei, vendor_version);
+                println!("  Actual compression:    method {}", actual_comp);
+                println!("  Salt (hex):            {}", to_hex(salt));
+                println!("  Password verify value: {}", to_hex(verify));
+                println!("  Encrypted payload:     {} bytes", ct.len());
+                println!("  Auth code:             {}", to_hex(auth));
+
+                let hash = format!(
+                    "$zip2$*0*{}*0*{}*{}*{:x}*{}*{}*$/zip2$",
+                    strength,
+                    to_hex(salt),
+                    to_hex(verify),
+                    ct.len(),
+                    if ct.is_empty() { String::new() } else { to_hex(ct) },
+                    to_hex(auth),
+                );
+
+                println!("\n  hashcat hash:");
+                println!("  {}", hash);
+                println!("  hashcat mode: 13600");
+                return Some((hash, "13600".to_string()));
+            }
+            println!("Error: Compression method 99 but no 0x9901 AES extra field found.");
+            return None;
+        }
 
         // checksum strings, matching zip2john exactly:
         //  - normal      : from crc32 top 2 bytes
@@ -196,6 +251,34 @@ fn next_local_header_after(
         }
     }
     Some(end)
+}
+
+/// Look for the WinZip AES extra-field record (header ID 0x9901, vendor "AE")
+/// in a local/central header's extra data. Returns (vendor_version, strength,
+/// actual_compression_method).
+fn find_aes_extra(
+    data: &[u8],
+    extra_start: usize,
+    extra_len: usize,
+) -> Option<(u16, u8, u16)> {
+    let ex = data.get(extra_start..extra_start + extra_len)?;
+    let mut off = 0usize;
+    while off + 4 <= ex.len() {
+        let tag = u16::from_le_bytes([ex[off], ex[off + 1]]);
+        let sz = u16::from_le_bytes([ex[off + 2], ex[off + 3]]) as usize;
+        if off + 4 + sz > ex.len() {
+            break;
+        }
+        if tag == 0x9901 && sz >= 7 {
+            let e = &ex[off + 4..off + 4 + sz];
+            if e[2] == b'A' && e[3] == b'E' {
+                let vendor_version = u16::from_le_bytes([e[0], e[1]]);
+                return Some((vendor_version, e[4], u16::from_le_bytes([e[5], e[6]])));
+            }
+        }
+        off += 4 + sz;
+    }
+    None
 }
 
 fn parse_data_descriptor(data: &[u8], search_from: usize) -> Option<(u32, usize, usize, usize)> {

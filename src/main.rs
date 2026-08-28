@@ -12,6 +12,7 @@ use std::io::{self, Write};
 test 
 -f /home/ali/Downloads/libere.xlsx
 -f /home/ali/Downloads/office2013.xlsx
+-f /home/ali/Downloads/sample.pdf.zip
 -f /tmp/opencode/samples/pdf_aes256.pdf
 -f /tmp/opencode/samples/pdf_rc4_40.pdf
 -f /tmp/opencode/samples/pdf_rc4_128.pdf
