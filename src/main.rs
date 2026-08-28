@@ -3,12 +3,19 @@ mod help;
 mod hashcat;
 mod file_type;
 mod encryption_extractor;
+mod pdf;
+mod zip;
+mod rar;
 use std::io::{self, Write};
 
 /*
 test 
 -f /home/ali/Downloads/libere.xlsx
 -f /home/ali/Downloads/office2013.xlsx
+-f /tmp/opencode/samples/pdf_aes256.pdf
+-f /tmp/opencode/samples/pdf_rc4_40.pdf
+-f /tmp/opencode/samples/pdf_rc4_128.pdf
+-f /tmp/opencode/samples/pdf_aes128.pdf
  */
 
 fn main() {
@@ -58,17 +65,30 @@ fn main() {
                         match file_type {
                             Some(ft) => {
                                 println!("File Type: {}", ft);
-                                // Here you can call the parsing function based on the file type
-                                // For example, if ft is "Excel File", you can call a function to parse Excel files
-                                // parse_excel(args[1]);
-                                if ft == "Excel 2007 to 2016+" {
-                                    // call the function to extract encryption information for Excel 2007 to 2016+ files
-                                    // it returns the hashcat hash and its mode, then start the attack
-                                    if let Some((hash, hashcat_mode)) =
-                                        encryption_extractor::excel_2007_to_2016(args[1])
-                                    {
-                                        hashcat::run_attack(&hash, &hashcat_mode);
+
+                                let result = match ft.as_str() {
+                                    "Excel 2007 to 2016+" =>
+                                        encryption_extractor::excel_2007_to_2016(args[1]),
+                                    "Word 2007 to 2016+" =>
+                                        encryption_extractor::excel_2007_to_2016(args[1]),
+                                    "Excel 2003 and older" =>
+                                        encryption_extractor::excel_legacy_9700(args[1], "Excel 2003 and older"),
+                                    "Word 2003 and older" =>
+                                        encryption_extractor::excel_legacy_9700(args[1], "Word 2003 and older"),
+                                    "PDF" =>
+                                        pdf::pdf_encryption(args[1]),
+                                    "ZIP" =>
+                                        zip::zip_encryption(args[1]),
+                                    "RAR" =>
+                                        rar::rar_encryption(args[1]),
+                                    other => {
+                                        println!("Error: Unsupported file type '{}'.", other);
+                                        None
                                     }
+                                };
+
+                                if let Some((hash, hashcat_mode)) = result {
+                                    hashcat::run_attack(&hash, &hashcat_mode);
                                 }
                             },
                             None => println!("Error: Could not determine the file type."),

@@ -52,6 +52,199 @@ pub fn excel_2007_to_2016(file_path: &str) -> Option<(String, String)> {
 //  Top-level dispatcher
 // ──────────────────────────────────────────────────────────────
 
+/// Legacy binary (pre-2007) Office files — .doc / .xls.
+/// Uses RC4 (1.1) or RC4 CryptoAPI (v2/v3/v4) and maps to hashcat mode 9700.
+///
+/// The RC4 CryptoAPI parameters are *not* stored in an "EncryptionInfo"
+/// stream for these formats. Instead:
+///   - .doc: the FibBase in the "wordDocument" stream says which table
+///           stream ("0Table"/"1Table") begins with the encryption block.
+///   - .xls: the "Workbook" stream contains a BIFF "FilePass" record whose
+///           payload starts with the encryption block.
+pub fn excel_legacy_9700(file_path: &str, label: &str) -> Option<(String, String)> {
+    println!("File Type: {} (Encrypted OLE Container)", label);
+
+    let path = Path::new(file_path);
+    if !path.exists() {
+        println!("Error: File does not exist: {}", file_path);
+        return None;
+    }
+
+    let mut comp = match cfb::open(path) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("Error: Failed to open file as an OLE/CFB container: {}", e);
+            return None;
+        }
+    };
+
+    // 1) Some containers (rare for .doc/.xls) really do use "EncryptionInfo".
+    if comp.exists("/EncryptionInfo") {
+        match read_stream(&mut comp, "/EncryptionInfo") {
+            Some(data) => {
+                println!("Found 'EncryptionInfo' stream ({} bytes).", data.len());
+                return parse_legacy_encryption_info(&data);
+            }
+            None => return None,
+        }
+    }
+
+    // 2) .doc: locate the table stream via the FibBase inside "wordDocument".
+    if comp.exists("/wordDocument") {
+        let wd = match read_stream(&mut comp, "/wordDocument") {
+            Some(d) => d,
+            None => return None,
+        };
+        if wd.len() < 12 {
+            println!("Error: wordDocument stream too small to hold a FibBase.");
+            return None;
+        }
+        let flags = u16::from_le_bytes([wd[10], wd[11]]);
+        let encrypted = (flags >> 8) & 1;
+        let which_tbl = (flags >> 9) & 1;
+        if encrypted == 0 {
+            println!("Status: The document is not flagged as encrypted (fEncrypted=0).");
+            println!("        XOR-obfuscated files store encryption here and cannot be cracked.");
+            return None;
+        }
+        let table = if which_tbl == 1 { "/1Table" } else { "/0Table" };
+        if !comp.exists(table) {
+            println!("Error: Table stream '{}' not found.", table);
+            return None;
+        }
+        let data = read_stream(&mut comp, table)?;
+        println!("Legacy encryption block found in '{}' stream ({} bytes).", table, data.len());
+        return parse_legacy_encryption_info(&data);
+    }
+
+    // 3) .xls: scan the "Workbook" stream for the FilePass record.
+    if comp.exists("/Workbook") {
+        let wb = match read_stream(&mut comp, "/Workbook") {
+            Some(d) => d,
+            None => return None,
+        };
+        // BIFF records: [type u16][size u16][payload size bytes]. FilePass = 0x002F.
+        let mut pos = 0usize;
+        let mut payload: Option<Vec<u8>> = None;
+        while pos + 4 <= wb.len() {
+            let rec_type = u16::from_le_bytes([wb[pos], wb[pos + 1]]);
+            let rec_size = u16::from_le_bytes([wb[pos + 2], wb[pos + 3]]) as usize;
+            if rec_size > wb.len() - pos - 4 {
+                break;
+            }
+            let body = &wb[pos + 4..pos + 4 + rec_size];
+            if rec_type == 0x002F {
+                payload = Some(body.to_vec());
+                break;
+            }
+            pos += 4 + rec_size;
+        }
+        return match payload {
+            Some(mut body) => {
+                println!("Found FilePass record ({} bytes).", body.len());
+                let w_encryption_type = u16::from_le_bytes([body[0], body[1]]);
+                body.drain(..2); // remove wEncryptionType, keep version...
+                match w_encryption_type {
+                    0x0001 => parse_legacy_encryption_info(&body),
+                    0x0000 => {
+                        println!("Status: XOR obfuscation — hashcat cannot crack this.");
+                        None
+                    }
+                    other => {
+                        println!("Error: Unknown encryption type 0x{:04x} in FilePass.", other);
+                        None
+                    }
+                }
+            }
+            None => {
+                println!("Status: No FilePass record found — the workbook is not encrypted.");
+                None
+            }
+        };
+    }
+
+    // 4) Fall back to an EncryptionInfo stream if still nothing matched.
+    println!("Status: No encryption parameters found in this OLE container.");
+    None
+}
+
+fn read_stream(comp: &mut cfb::CompoundFile<std::fs::File>, name: &str) -> Option<Vec<u8>> {
+    match comp.open_stream(name) {
+        Ok(mut stream) => {
+            let mut data = Vec::new();
+            match stream.read_to_end(&mut data) {
+                Ok(_) => Some(data),
+                Err(e) => {
+                    println!("Error reading stream {}: {}", name, e);
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            println!("Error opening stream {}: {}", name, e);
+            None
+        }
+    }
+}
+
+fn parse_legacy_encryption_info(data: &[u8]) -> Option<(String, String)> {
+    if data.len() < 4 {
+        eprintln!("Error: Encryption data too short ({} bytes).", data.len());
+        return None;
+    }
+
+    let v_major = u16::from_le_bytes([data[0], data[1]]);
+    let v_minor = u16::from_le_bytes([data[2], data[3]]);
+    println!("Encryption Version: vMajor={}, vMinor={}", v_major, v_minor);
+
+    match v_major {
+        1 => {
+            if v_minor == 1 {
+                // Plain RC4 (MS-OFFCRYPTO RC4): salt + verifier + verifierHash, no header.
+                const RC4_INFO_LEN: usize = 16 + 16 + 16;
+                if data.len() < 4 + RC4_INFO_LEN {
+                    println!("Error: RC4 encryption block too short ({} bytes).", data.len());
+                    return None;
+                }
+                let salt = &data[4..20];
+                let ev = &data[20..36];
+                let evh = &data[36..52];
+                println!("\n  RC4 (v1.1) params:");
+                println!("    salt:                    {}", to_hex(salt));
+                println!("    encryptedVerifier:       {}", to_hex(ev));
+                println!("    encryptedVerifierHash:    {}", to_hex(evh));
+
+                let hash = format!(
+                    "$oldoffice$0*{}*{}*{}",
+                    to_hex(salt),
+                    to_hex(ev),
+                    to_hex(evh)
+                );
+                println!("\n  hashcat hash:");
+                println!("  {}", hash);
+                println!("  hashcat mode: 9700");
+                return Some((hash, "9700".to_string()));
+            }
+            println!("Error: Unsupported legacy version v{}.{}.", v_major, v_minor);
+            None
+        }
+        2 | 3 | 4 => {
+            if v_minor != 2 {
+                println!("Error: Unsupported minor version v{}.{}.", v_major, v_minor);
+                return None;
+            }
+            if v_major == 4 {
+                println!("Note: v4 legacy RC4 CryptoAPI — mapping to mode 9700.");
+            }
+            parse_standard_encryption(&data[4..], v_major, true)
+        }
+        _ => {
+            println!("Error: Unsupported legacy version v{}.", v_major);
+            None
+        }
+    }
+}
+
 fn parse_encryption_info(data: &[u8]) -> Option<(String, String)> {
     if data.len() < 4 {
         eprintln!("Error: EncryptionInfo stream too short ({} bytes).", data.len());
@@ -65,7 +258,7 @@ fn parse_encryption_info(data: &[u8]) -> Option<(String, String)> {
 
     match v_major {
         4 => Some(parse_agile_encryption(&data[4..])),
-        2 | 3 => Some(parse_standard_encryption(&data[4..], v_major)),
+        2 | 3 => parse_standard_encryption(&data[4..], v_major, false),
         _ => {
             println!("Unsupported encryption version: vMajor={}", v_major);
             None
@@ -199,7 +392,7 @@ fn parse_agile_encryption(data: &[u8]) -> (String, String) {
 //  encryption header size) precede the binary header + verifier.
 // ──────────────────────────────────────────────────────────────
 
-fn parse_standard_encryption(data: &[u8], version: u16) -> (String, String) {
+fn parse_standard_encryption(data: &[u8], version: u16, legacy: bool) -> Option<(String, String)> {
     // EncryptionInfo layout (all u32 LE):
     //   [ 0.. 4] HeaderFlags  (reserved)
     //   [ 4.. 8] EncryptionHeaderSize  (size of EncryptionHeader in bytes)
@@ -225,7 +418,7 @@ fn parse_standard_encryption(data: &[u8], version: u16) -> (String, String) {
             "Error: Standard encryption data too short ({} bytes).",
             data.len()
         );
-        return (String::new(), String::new());
+        return None;
     }
 
     let header_flags = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
@@ -255,6 +448,7 @@ fn parse_standard_encryption(data: &[u8], version: u16) -> (String, String) {
     );
 
     println!("\n=== Standard Encryption (Office 2007, v{}) ===", version);
+    let _ = legacy;
     println!("  HeaderFlags:    0x{:08X}", header_flags);
     println!("  HeaderSize:     {}", header_size);
     println!("  Flags:         0x{:08X}", flags);
@@ -273,13 +467,13 @@ fn parse_standard_encryption(data: &[u8], version: u16) -> (String, String) {
 
     // ── Parse EncryptionVerifier ──
     let verifier_offset = csp_end + 2; // +2 to skip the null terminator
-    if data.len() < verifier_offset + 72 {
+    if data.len() < verifier_offset + 40 {
         println!(
             "Error: Not enough data for EncryptionVerifier (need {}, have {}).",
-            verifier_offset + 72,
+            verifier_offset + 40,
             data.len()
         );
-        return (String::new(), String::new());
+        return None;
     }
 
     let v = &data[verifier_offset..];
@@ -287,11 +481,22 @@ fn parse_standard_encryption(data: &[u8], version: u16) -> (String, String) {
     let salt = &v[4..20]; // 16 bytes
     let encrypted_verifier = &v[20..36]; // 16 bytes
     let verifier_hash_size = u32::from_le_bytes([v[36], v[37], v[38], v[39]]);
-    let encrypted_verifier_hash = &v[40..72]; // 32 bytes
+    // Legacy RC4 CryptoAPI verifier hashes are MD5 (16) or SHA1 (20) bytes.
+    // OOXML standard encryption stores 32 bytes of verifier hash.
+    let vhs = if legacy { verifier_hash_size.min(20) as usize } else { 32 };
+    if v.len() < 40 + vhs {
+        println!(
+            "Error: Not enough data for the verifier hash (need {}, have {}).",
+            40 + vhs,
+            v.len()
+        );
+        return None;
+    }
+    let evh_full = &v[40..40 + vhs];
 
     let salt_hex = to_hex(salt);
     let ev_hex = to_hex(encrypted_verifier);
-    let evh_hex = to_hex(encrypted_verifier_hash);
+    let evh_hex = to_hex(evh_full);
 
     println!("\n  SaltSize:               {}", salt_size_val);
     println!("  Salt (hex):             {}", salt_hex);
@@ -299,24 +504,55 @@ fn parse_standard_encryption(data: &[u8], version: u16) -> (String, String) {
     println!("  VerifierHashSize:      {}", verifier_hash_size);
     println!("  EncryptedVerifierHash:  {}", evh_hex);
 
-    // hashcat mode 9400 expects the encrypted verifier hash to be exactly
-    // 20 bytes (40 hex chars). AES files store 32 bytes where the first
-    // 20 bytes are the SHA1 and the rest is random padding, so truncate.
-    let evh_hex_trimmed = &evh_hex[..evh_hex.len().min(40)];
+    if legacy {
+        if verifier_hash_size <= 16 {
+            // MD5-based verifier -> mode 9700, prefix $0, hash field = 16 bytes.
+            let hash = format!(
+                "$oldoffice$0*{}*{}*{}",
+                salt_hex,
+                ev_hex,
+                &evh_hex[..evh_hex.len().min(32)]
+            );
+            println!("\n  hashcat hash:");
+            println!("  {}", hash);
+            println!("  hashcat mode: 9700");
+            Some((hash, "9700".to_string()))
+        } else {
+            // SHA1-based RC4 CryptoAPI -> mode 9800. Prefix selects the RC4
+            // key length: $3 = 40-bit, $4 = 128-bit (hash field = full SHA1).
+            let typ = match key_size {
+                40 => 3,
+                56 => 5,
+                _ => 4,
+            };
+            let hash = format!(
+                "$oldoffice${}*{}*{}*{}",
+                typ, salt_hex, ev_hex, evh_hex
+            );
+            println!("\n  hashcat hash:");
+            println!("  {}", hash);
+            println!("  hashcat mode: 9800");
+            Some((hash, "9800".to_string()))
+        }
+    } else {
+        // hashcat mode 9400 expects the encrypted verifier hash to be exactly
+        // 20 bytes (40 hex chars). AES files store 32 bytes where the first
+        // 20 bytes are the SHA1 and the rest is random padding, so truncate.
+        let hash = format!(
+            "$office$*2007*20*{}*{}*{}*{}*{}",
+            key_size,
+            salt_size_val,
+            salt_hex,
+            ev_hex,
+            &evh_hex[..evh_hex.len().min(40)]
+        );
 
-    // Build office2john / hashcat hash
-    // $office$*2007*20*<keyBits>*<saltSize>*<salt>*<verifier>*<verifierHash>
-    // Note: field 2 = 20 (SHA1 hash size, not spin count — standard enc. has no spin count)
-    let hash = format!(
-        "$office$*2007*20*{}*{}*{}*{}*{}",
-        key_size, salt_size_val, salt_hex, ev_hex, evh_hex_trimmed
-    );
+        println!("\n  office2john / hashcat hash:");
+        println!("  {}", hash);
+        println!("  hashcat mode: 9400");
 
-    println!("\n  office2john / hashcat hash:");
-    println!("  {}", hash);
-    println!("  hashcat mode: 9400");
-
-    (hash, "9400".to_string())
+        Some((hash, "9400".to_string()))
+    }
 }
 
 // ──────────────────────────────────────────────────────────────

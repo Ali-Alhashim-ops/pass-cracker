@@ -6,3 +6,4 @@
 
   test it on xlsx file protected by libera office password         cracked
   test it on xlsx file protected by Microsoft office 2010 password cracked
+  test it on .pdf file protected by password                       cracked
